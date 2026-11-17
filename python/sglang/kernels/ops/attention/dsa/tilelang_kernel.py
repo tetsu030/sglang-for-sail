@@ -123,13 +123,18 @@ def sparse_attention_fwd_kernel_v1(
     accum_dtype = "float"
 
     H = head_kv
-    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
-    if padded_H != H:
-        assert kv_group == 1
+    # Two 16-row tiles avoid the single-tile reduction layout failure on PPU.
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), 32)
     BI = block_I
     NI = tilelang.cdiv(topk, block_I)
     D = dim
     D_tail = tail_dim
+    D_tail_padded = max(D_tail, 16) if has_tail else 0
+
+    pv_n_warp = min(D // 16, threads // 32)
+    pv_policy = T.GemmWarpPolicy.FullCol
+    if D % pv_n_warp != 0 or (D // pv_n_warp) % 16 != 0:
+        pv_policy = T.GemmWarpPolicy.FullRow
 
     if head_kv > 64:
         assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
@@ -157,19 +162,21 @@ def sparse_attention_fwd_kernel_v1(
         ):
             Q_shared = T.alloc_shared([H_per_block, D], dtype)
             if has_tail:
-                Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+                Q_tail_shared = T.alloc_shared([H_per_block, D_tail_padded], dtype)
             KV_shared = T.alloc_shared([BI, D], dtype)
             if has_tail:
-                K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            O_shared = T.alloc_shared([H_per_block, D], dtype)
+                K_tail_shared = T.alloc_shared([BI, D_tail_padded], dtype)
+            if padded_H != H:
+                O_shared = T.alloc_shared([H_per_block, D], dtype)
             mask = T.alloc_fragment([BI], "bool")
 
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
             S_shared = T.alloc_shared([H_per_block, BI], dtype)
-            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            # Shared statistics decouple the QK and PV fragment layouts on PPU.
+            sumexp = T.alloc_shared([H_per_block], accum_dtype)
             sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
-            alpha = T.alloc_fragment([H_per_block], accum_dtype)
+            alpha = T.alloc_shared([H_per_block], accum_dtype)
             m_i = T.alloc_fragment([H_per_block], accum_dtype)
             m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
 
@@ -182,26 +189,39 @@ def sparse_attention_fwd_kernel_v1(
             q_i = s_i
             max_kv_i = q_i
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
-            H1 = H0 + H_per_block
+            H0 = g_i * H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H1 = H0 + (H if padded_H != H else H_per_block)
 
-            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
-            if has_tail:
-                T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+            if padded_H == H:
+                T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
+                if has_tail:
+                    if D_tail_padded != D_tail:
+                        T.fill(Q_tail_shared, 0)
+                    T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared[:, :D_tail])
+            else:
+                T.fill(Q_shared, 0)
+                T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared[:H, :])
+                if has_tail:
+                    T.fill(Q_tail_shared, 0)
+                    T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared[:H, :D_tail])
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
                 for bi_i in T.Parallel(BI):
                     mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
 
                 for bi_i, d_i in T.Parallel(BI, D):
+                    idx = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
                     KV_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i
                     ]
                 if has_tail:
+                    if D_tail_padded != D_tail:
+                        T.fill(K_tail_shared, 0)
                     for bi_i, d_i in T.Parallel(BI, D_tail):
+                        idx = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
                         K_tail_shared[bi_i, d_i] = KV[
                             b_i,
-                            Indices[b_i, s_i, g_i, i_i * BI + bi_i],
+                            T.if_then_else(idx >= 0, idx, 0),
                             g_i,
                             D + d_i,
                         ]
@@ -240,16 +260,21 @@ def sparse_attention_fwd_kernel_v1(
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
 
                 T.copy(acc_s, S_shared)
-                T.gemm(S_shared, KV_shared, acc_o, policy=gemm_policy)
+                T.gemm(S_shared, KV_shared, acc_o, policy=pv_policy)
 
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
+                acc_o[h_i, d_i] /= T.if_then_else(sumexp[h_i] == 0, 1.0, sumexp[h_i])
             for h_i in T.Parallel(H_per_block):
-                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                sumexp[h_i] = T.log2(
+                    T.if_then_else(sumexp[h_i] == 0, 1.0, sumexp[h_i])
+                ) + m_i[h_i] * sm_scale
 
-            T.copy(acc_o, O_shared)
-            T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+            if padded_H == H:
+                T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+            else:
+                T.copy(acc_o, O_shared)
+                T.copy(O_shared[:H, :], Output[b_i, s_i, H0:H1, :])
 
     return main
 
